@@ -3,6 +3,7 @@
     FS
     HEAP8
     Module
+    _malloc
     _free
     addFunction
     allocate
@@ -14,11 +15,17 @@
     stackAlloc
     stackRestore
     stackSave
+    UTF8ToString
+    stringToUTF8
+    lengthBytesUTF8
 */
 
+"use strict";
+
 /**
- * @typedef {{Database:Database}} SqlJs
- * @property {Database} Database the database constructor
+ * @typedef {{Database:Database, Statement:Statement}} SqlJs
+ * @property {Database} Database A class that represents an SQLite database
+ * @property {Statement} Statement The prepared statement class
  */
 
 /**
@@ -48,8 +55,6 @@
  */
 // Wait for preRun to run, and then finish our initialization
 Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
-    "use strict";
-
     // Declare toplevel variables
     // register, used for temporary stack values
     var apiTemp = stackAlloc(4);
@@ -79,6 +84,12 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         "sqlite3_prepare_v2",
         "number",
         ["number", "string", "number", "number", "number"]
+    );
+    var sqlite3_sql = cwrap("sqlite3_sql", "string", ["number"]);
+    var sqlite3_normalized_sql = cwrap(
+        "sqlite3_normalized_sql",
+        "string",
+        ["number"]
     );
     var sqlite3_prepare_v2_sqlptr = cwrap(
         "sqlite3_prepare_v2",
@@ -112,6 +123,11 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     );
     var sqlite3_step = cwrap("sqlite3_step", "number", ["number"]);
     var sqlite3_errmsg = cwrap("sqlite3_errmsg", "string", ["number"]);
+    var sqlite3_column_count = cwrap(
+        "sqlite3_column_count",
+        "number",
+        ["number"]
+    );
     var sqlite3_data_count = cwrap("sqlite3_data_count", "number", ["number"]);
     var sqlite3_column_double = cwrap(
         "sqlite3_column_double",
@@ -166,10 +182,18 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         ]
     );
     var sqlite3_value_type = cwrap("sqlite3_value_type", "number", ["number"]);
-    var sqlite3_value_bytes = cwrap("sqlite3_value_bytes", "number", ["number"]);
+    var sqlite3_value_bytes = cwrap(
+        "sqlite3_value_bytes",
+        "number",
+        ["number"]
+    );
     var sqlite3_value_text = cwrap("sqlite3_value_text", "string", ["number"]);
     var sqlite3_value_blob = cwrap("sqlite3_value_blob", "number", ["number"]);
-    var sqlite3_value_double = cwrap("sqlite3_value_double", "number", ["number"]);
+    var sqlite3_value_double = cwrap(
+        "sqlite3_value_double",
+        "number",
+        ["number"]
+    );
     var sqlite3_result_double = cwrap(
         "sqlite3_result_double",
         "",
@@ -190,7 +214,11 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         "",
         ["number", "number", "number", "number"]
     );
-    var sqlite3_result_int = cwrap("sqlite3_result_int", "", ["number", "number"]);
+    var sqlite3_result_int = cwrap(
+        "sqlite3_result_int",
+        "",
+        ["number", "number"]
+    );
     var sqlite3_result_error = cwrap(
         "sqlite3_result_error",
         "",
@@ -211,8 +239,13 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     * You can't instantiate this class directly, you have to use a
     * {@link Database} object in order to create a statement.
     *
-    * **Warning**: When you close a database (using db.close()),
-    * all its statements are closed too and become unusable.
+    * **Warnings**
+    * 1. When you close a database (using db.close()), all
+    * its statements are closed too and become unusable.
+    * 1. After calling db.prepare() you must manually free the assigned memory
+    * by calling Statement.free(). Failure to do this will cause subsequent
+    * 'DROP TABLE ...' statements to fail with 'Uncaught Error: database table
+    * is locked'.
     *
     * Statements can't be created by the API user directly, only by
     * Database::prepare
@@ -236,13 +269,16 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     }
 
     /** @typedef {string|number|null|Uint8Array} Database.SqlValue */
-    /** @typedef {Database.SqlValue[]|Object<string, Database.SqlValue>|null} Statement.BindParams
+    /** @typedef {
+        Database.SqlValue[]|Object<string, Database.SqlValue>|null
+    } Statement.BindParams
      */
 
     /** Bind values to the parameters, after having reseted the statement.
     * If values is null, do nothing and return true.
     *
-    * SQL statements can have parameters, named *'?', '?NNN', ':VVV', '@VVV', '$VVV'*,
+    * SQL statements can have parameters,
+    * named *'?', '?NNN', ':VVV', '@VVV', '$VVV'*,
     * where NNN is a number and VVV a string.
     * This function binds these parameters to the given values.
     *
@@ -282,7 +318,9 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         }
         this["reset"]();
         if (Array.isArray(values)) return this.bindFromArray(values);
-        if (values != null && typeof values === "object") return this.bindFromObject(values);
+        if (values != null && typeof values === "object") {
+            return this.bindFromObject(values);
+        }
         return true;
     };
 
@@ -293,12 +331,11 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     @throws {String} SQLite Error
      */
     Statement.prototype["step"] = function step() {
-        var ret;
         if (!this.stmt) {
             throw "Statement closed";
         }
         this.pos = 1;
-        ret = sqlite3_step(this.stmt);
+        var ret = sqlite3_step(this.stmt);
         switch (ret) {
             case SQLITE_ROW:
                 return true;
@@ -330,21 +367,15 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     };
 
     Statement.prototype.getBlob = function getBlob(pos) {
-        var i;
-        var ptr;
-        var result;
-        var size;
         if (pos == null) {
             pos = this.pos;
             this.pos += 1;
         }
-        size = sqlite3_column_bytes(this.stmt, pos);
-        ptr = sqlite3_column_blob(this.stmt, pos);
-        result = new Uint8Array(size);
-        i = 0;
-        while (i < size) {
+        var size = sqlite3_column_bytes(this.stmt, pos);
+        var ptr = sqlite3_column_blob(this.stmt, pos);
+        var result = new Uint8Array(size);
+        for (var i = 0; i < size; i += 1) {
             result[i] = HEAP8[ptr + i];
-            i += 1;
         }
         return result;
     };
@@ -355,21 +386,18 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     to the statement before it is executed
     @return {Database.SqlValue[]} One row of result
 
-    @example <caption>Print all the rows of the table test to the console</caption>
+    @example
+    <caption>Print all the rows of the table test to the console</caption>
     var stmt = db.prepare("SELECT * FROM test");
     while (stmt.step()) console.log(stmt.get());
      */
     Statement.prototype["get"] = function get(params) {
-        var field;
-        var ref;
-        var results1;
         if (params != null && this["bind"](params)) {
             this["step"]();
         }
-        results1 = [];
-        field = 0;
-        ref = sqlite3_data_count(this.stmt);
-        while (field < ref) {
+        var results1 = [];
+        var ref = sqlite3_data_count(this.stmt);
+        for (var field = 0; field < ref; field += 1) {
             switch (sqlite3_column_type(this.stmt, field)) {
                 case SQLITE_INTEGER:
                 case SQLITE_FLOAT:
@@ -384,7 +412,6 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
                 default:
                     results1.push(null);
             }
-            field += 1;
         }
         return results1;
     };
@@ -392,21 +419,18 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     /** Get the list of column names of a row of result of a statement.
     @return {string[]} The names of the columns
     @example
-    var stmt = db.prepare("SELECT 5 AS nbr, x'616200' AS data, NULL AS null_value;");
+    var stmt = db.prepare(
+        "SELECT 5 AS nbr, x'616200' AS data, NULL AS null_value;"
+    );
     stmt.step(); // Execute the statement
     console.log(stmt.getColumnNames());
     // Will print ['nbr','data','null_value']
      */
     Statement.prototype["getColumnNames"] = function getColumnNames() {
-        var i;
-        var ref;
-        var results1;
-        results1 = [];
-        i = 0;
-        ref = sqlite3_data_count(this.stmt);
-        while (i < ref) {
+        var results1 = [];
+        var ref = sqlite3_column_count(this.stmt);
+        for (var i = 0; i < ref; i += 1) {
             results1.push(sqlite3_column_name(this.stmt, i));
-            i += 1;
         }
         return results1;
     };
@@ -420,31 +444,45 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
 
     @example
 
-        var stmt = db.prepare("SELECT 5 AS nbr;
-        var x'616200' AS data;
-        var NULL AS null_value;");
+        var stmt = db.prepare(
+            "SELECT 5 AS nbr, x'010203' AS data, NULL AS null_value;"
+        );
         stmt.step(); // Execute the statement
         console.log(stmt.getAsObject());
         // Will print {nbr:5, data: Uint8Array([1,2,3]), null_value:null}
      */
     Statement.prototype["getAsObject"] = function getAsObject(params) {
-        var i;
-        var len;
-        var name;
-        var names;
-        var rowObject;
-        var values;
-        values = this["get"](params);
-        names = this["getColumnNames"]();
-        rowObject = {};
-        i = 0;
-        len = names.length;
-        while (i < len) {
-            name = names[i];
+        var values = this["get"](params);
+        var names = this["getColumnNames"]();
+        var rowObject = {};
+        for (var i = 0; i < names.length; i += 1) {
+            var name = names[i];
             rowObject[name] = values[i];
-            i += 1;
         }
         return rowObject;
+    };
+
+    /** Get the SQL string used in preparing this statement.
+     @return {string} The SQL string
+     */
+    Statement.prototype["getSQL"] = function getSQL() {
+        return sqlite3_sql(this.stmt);
+    };
+
+    /** Get the SQLite's normalized version of the SQL string used in
+    preparing this statement.  The meaning of "normalized" is not
+    well-defined: see {@link https://sqlite.org/c3ref/expanded_sql.html
+    the SQLite documentation}.
+
+     @example
+     db.run("create table test (x integer);");
+     stmt = db.prepare("select * from test where x = 42");
+     // returns "SELECT*FROM test WHERE x=?;"
+
+     @return {string} The normalized SQL string
+     */
+    Statement.prototype["getNormalizedSQL"] = function getNormalizedSQL() {
+        return sqlite3_normalized_sql(this.stmt);
     };
 
     /** Shorthand for bind + step + reset
@@ -461,14 +499,12 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     };
 
     Statement.prototype.bindString = function bindString(string, pos) {
-        var bytes;
-        var strptr;
         if (pos == null) {
             pos = this.pos;
             this.pos += 1;
         }
-        bytes = intArrayFromString(string);
-        strptr = allocate(bytes, "i8", ALLOC_NORMAL);
+        var bytes = intArrayFromString(string);
+        var strptr = allocate(bytes, ALLOC_NORMAL);
         this.allocatedmem.push(strptr);
         this.db.handleError(sqlite3_bind_text(
             this.stmt,
@@ -481,12 +517,11 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     };
 
     Statement.prototype.bindBlob = function bindBlob(array, pos) {
-        var blobptr;
         if (pos == null) {
             pos = this.pos;
             this.pos += 1;
         }
-        blobptr = allocate(array, "i8", ALLOC_NORMAL);
+        var blobptr = allocate(array, ALLOC_NORMAL);
         this.allocatedmem.push(blobptr);
         this.db.handleError(sqlite3_bind_blob(
             this.stmt,
@@ -499,12 +534,11 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     };
 
     Statement.prototype.bindNumber = function bindNumber(num, pos) {
-        var bindfunc;
         if (pos == null) {
             pos = this.pos;
             this.pos += 1;
         }
-        bindfunc = (
+        var bindfunc = (
             num === (num | 0)
                 ? sqlite3_bind_int
                 : sqlite3_bind_double
@@ -558,8 +592,7 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     Statement.prototype.bindFromObject = function bindFromObject(valuesObj) {
         var that = this;
         Object.keys(valuesObj).forEach(function each(name) {
-            var num;
-            num = sqlite3_bind_parameter_index(that.stmt, name);
+            var num = sqlite3_bind_parameter_index(that.stmt, name);
             if (num !== 0) {
                 that.bindValue(valuesObj[name], num);
             }
@@ -573,11 +606,8 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     @nodoc
      */
     Statement.prototype.bindFromArray = function bindFromArray(values) {
-        var num;
-        num = 0;
-        while (num < values.length) {
+        for (var num = 0; num < values.length; num += 1) {
             this.bindValue(values[num], num + 1);
-            num += 1;
         }
         return true;
     };
@@ -614,6 +644,137 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         return res;
     };
 
+    /**
+     * @classdesc
+     * An iterator over multiple SQL statements in a string,
+     * preparing and returning a Statement object for the next SQL
+     * statement on each iteration.
+     *
+     * You can't instantiate this class directly, you have to use a
+     * {@link Database} object in order to create a statement iterator
+     *
+     * {@see Database#iterateStatements}
+     *
+     * @example
+     * // loop over and execute statements in string sql
+     * for (let statement of db.iterateStatements(sql) {
+     *     statement.step();
+     *     // get results, etc.
+     *     // do not call statement.free() manually, each statement is freed
+     *     // before the next one is parsed
+     * }
+     *
+     * // capture any bad query exceptions with feedback
+     * // on the bad sql
+     * let it = db.iterateStatements(sql);
+     * try {
+     *     for (let statement of it) {
+     *         statement.step();
+     *     }
+     * } catch(e) {
+     *     console.log(
+     *         `The SQL string "${it.getRemainingSQL()}" ` +
+     *         `contains the following error: ${e}`
+     *     );
+     * }
+     *
+     * @implements {Iterator<Statement>}
+     * @implements {Iterable<Statement>}
+     * @constructs StatementIterator
+     * @memberof module:SqlJs
+     * @param {string} sql A string containing multiple SQL statements
+     * @param {Database} db The database from which this iterator was created
+     */
+    function StatementIterator(sql, db) {
+        this.db = db;
+        var sz = lengthBytesUTF8(sql) + 1;
+        this.sqlPtr = _malloc(sz);
+        if (this.sqlPtr === null) {
+            throw new Error("Unable to allocate memory for the SQL string");
+        }
+        stringToUTF8(sql, this.sqlPtr, sz);
+        this.nextSqlPtr = this.sqlPtr;
+        this.nextSqlString = null;
+        this.activeStatement = null;
+    }
+
+    /**
+     * @typedef {{ done:true, value:undefined } |
+     *           { done:false, value:Statement}}
+     *           StatementIterator.StatementIteratorResult
+     * @property {Statement} value the next available Statement
+     * (as returned by {@link Database.prepare})
+     * @property {boolean} done true if there are no more available statements
+     */
+
+    /** Prepare the next available SQL statement
+     @return {StatementIterator.StatementIteratorResult}
+     @throws {String} SQLite error or invalid iterator error
+     */
+    StatementIterator.prototype["next"] = function next() {
+        if (this.sqlPtr === null) {
+            return { done: true };
+        }
+        if (this.activeStatement !== null) {
+            this.activeStatement["free"]();
+            this.activeStatement = null;
+        }
+        if (!this.db.db) {
+            this.finalize();
+            throw new Error("Database closed");
+        }
+        var stack = stackSave();
+        var pzTail = stackAlloc(4);
+        setValue(apiTemp, 0, "i32");
+        setValue(pzTail, 0, "i32");
+        try {
+            this.db.handleError(sqlite3_prepare_v2_sqlptr(
+                this.db.db,
+                this.nextSqlPtr,
+                -1,
+                apiTemp,
+                pzTail
+            ));
+            this.nextSqlPtr = getValue(pzTail, "i32");
+            var pStmt = getValue(apiTemp, "i32");
+            if (pStmt === NULL) {
+                this.finalize();
+                return { done: true };
+            }
+            this.activeStatement = new Statement(pStmt, this.db);
+            this.db.statements[pStmt] = this.activeStatement;
+            return { value: this.activeStatement, done: false };
+        } catch (e) {
+            this.nextSqlString = UTF8ToString(this.nextSqlPtr);
+            this.finalize();
+            throw e;
+        } finally {
+            stackRestore(stack);
+        }
+    };
+
+    StatementIterator.prototype.finalize = function finalize() {
+        _free(this.sqlPtr);
+        this.sqlPtr = null;
+    };
+
+    /** Get any un-executed portions remaining of the original SQL string
+     @return {String}
+     */
+    StatementIterator.prototype["getRemainingSQL"] = function getRemainder() {
+        // iff an exception occurred, we set the nextSqlString
+        if (this.nextSqlString !== null) return this.nextSqlString;
+        // otherwise, convert from nextSqlPtr
+        return UTF8ToString(this.nextSqlPtr);
+    };
+
+    /* implement Iterable interface */
+
+    if (typeof Symbol === "function" && typeof Symbol.iterator === "symbol") {
+        StatementIterator.prototype[Symbol.iterator] = function iterator() {
+            return this;
+        };
+    }
 
     /** @classdesc
     * Represents an SQLite database
@@ -653,17 +814,19 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
 
     @example
     // Insert values in a table
-    db.run("INSERT INTO test VALUES (:age, :name)", { ':age' : 18, ':name' : 'John' });
+    db.run(
+        "INSERT INTO test VALUES (:age, :name)",
+        { ':age' : 18, ':name' : 'John' }
+    );
 
     @return {Database} The database object (useful for method chaining)
      */
     Database.prototype["run"] = function run(sql, params) {
-        var stmt;
         if (!this.db) {
             throw "Database closed";
         }
         if (params) {
-            stmt = this["prepare"](sql, params);
+            var stmt = this["prepare"](sql, params);
             try {
                 stmt["step"]();
             } finally {
@@ -676,7 +839,10 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     };
 
     /**
-     * @typedef {{columns:string[], values:Database.SqlValue[][]}} Database.QueryExecResult
+     * @typedef {{
+        columns:string[],
+        values:Database.SqlValue[][]
+    }} Database.QueryExecResult
      * @property {string[]} columns the name of the columns of the result
      * (as returned by {@link Statement.getColumnNames})
      * @property {Database.SqlValue[][]} values one array per row, containing
@@ -739,12 +905,11 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     * @return {Database.QueryExecResult[]} The results of each statement
     */
     Database.prototype["exec"] = function exec(sql, params) {
-        var curresult;
-        var stmt;
         if (!this.db) {
             throw "Database closed";
         }
         var stack = stackSave();
+        var stmt = null;
         try {
             var nextSqlPtr = allocateUTF8OnStack(sql);
             var pzTail = stackAlloc(4);
@@ -764,7 +929,7 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
                 nextSqlPtr = getValue(pzTail, "i32");
                 // Empty statement
                 if (pStmt !== NULL) {
-                    curresult = null;
+                    var curresult = null;
                     stmt = new Statement(pStmt, this);
                     if (params != null) {
                         stmt.bind(params);
@@ -784,9 +949,7 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
             }
             return results;
         } catch (errCaught) {
-            if (stmt) {
-                stmt["free"]();
-            }
+            if (stmt) stmt["free"]();
             throw errCaught;
         } finally {
             stackRestore(stack);
@@ -803,7 +966,8 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     @param {Statement.BindParams} [params=[]] Parameters to bind to the query
     @param {function(Object<string, Database.SqlValue>):void} callback
     Function to call on each row of result
-    @param {function():void} done A function that will be called when all rows have been retrieved
+    @param {function():void} done A function that will be called when
+    all rows have been retrieved
 
     @return {Database} The database object. Useful for method chaining
 
@@ -841,16 +1005,14 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     @throws {String} SQLite error
      */
     Database.prototype["prepare"] = function prepare(sql, params) {
-        var pStmt;
-        var stmt;
         setValue(apiTemp, 0, "i32");
         this.handleError(sqlite3_prepare_v2(this.db, sql, -1, apiTemp, NULL));
         // pointer to a statement, or null
-        pStmt = getValue(apiTemp, "i32");
+        var pStmt = getValue(apiTemp, "i32");
         if (pStmt === NULL) {
             throw "Nothing to prepare";
         }
-        stmt = new Statement(pStmt, this);
+        var stmt = new Statement(pStmt, this);
         if (params != null) {
             stmt.bind(params);
         }
@@ -858,18 +1020,37 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         return stmt;
     };
 
+    /** Iterate over multiple SQL statements in a SQL string.
+     * This function returns an iterator over {@link Statement} objects.
+     * You can use a for..of loop to execute the returned statements one by one.
+     * @param {string} sql a string of SQL that can contain multiple statements
+     * @return {StatementIterator} the resulting statement iterator
+     * @example <caption>Get the results of multiple SQL queries</caption>
+     * const sql_queries = "SELECT 1 AS x; SELECT '2' as y";
+     * for (const statement of db.iterateStatements(sql_queries)) {
+     *     const sql = statement.getSQL(); // Get the SQL source
+     *     const result = statement.getAsObject({}); // Get the row of data
+     *     console.log(sql, result);
+     * }
+     * // This will print:
+     * // 'SELECT 1 AS x;' { x: 1 }
+     * // " SELECT '2' as y" { y: '2' }
+     */
+    Database.prototype["iterateStatements"] = function iterateStatements(sql) {
+        return new StatementIterator(sql, this);
+    };
+
     /** Exports the contents of the database to a binary array
     @return {Uint8Array} An array of bytes of the SQLite3 database file
      */
     Database.prototype["export"] = function exportDatabase() {
-        var binaryDb;
         Object.values(this.statements).forEach(function each(stmt) {
             stmt["free"]();
         });
         Object.values(this.functions).forEach(removeFunction);
         this.functions = {};
         this.handleError(sqlite3_close_v2(this.db));
-        binaryDb = FS.readFile(this.filename, { encoding: "binary" });
+        var binaryDb = FS.readFile(this.filename, { encoding: "binary" });
         this.handleError(sqlite3_open(this.filename, apiTemp));
         this.db = getValue(apiTemp, "i32");
         return binaryDb;
@@ -879,8 +1060,8 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     * The memory associated to the database and all associated statements
     * will be freed.
     *
-    * **Warning**: A statement belonging to a database that has been closed cannot
-    * be used anymore.
+    * **Warning**: A statement belonging to a database that has been closed
+    * cannot be used anymore.
     *
     * Databases **must** be closed when you're finished with them, or the
     * memory consumption will grow forever
@@ -913,8 +1094,8 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         throw new Error(errmsg);
     };
 
-    /** Returns the number of changed rows (modified, inserted or deleted) by the
-    latest completed INSERT, UPDATE or DELETE statement on the
+    /** Returns the number of changed rows (modified, inserted or deleted)
+    by the latest completed INSERT, UPDATE or DELETE statement on the
     database. Executing any other type of SQL statement does not modify
     the value returned by this function.
 
@@ -929,19 +1110,24 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         db.create_function("addOne", function (x) {return x+1;})
         db.exec("SELECT addOne(1)") // = 2
 
-    @param {string} name the name of the function as referenced in SQL statements.
+    @param {string} name the name of the function as referenced in
+    SQL statements.
     @param {function} func the actual function to be executed.
     @return {Database} The database object. Useful for method chaining
      */
-    Database.prototype["create_function"] = function create_function(name, func) {
-        var func_ptr;
+    Database.prototype["create_function"] = function create_function(
+        name,
+        func
+    ) {
         function wrapped_func(cx, argc, argv) {
             var result;
             function extract_blob(ptr) {
                 var size = sqlite3_value_bytes(ptr);
                 var blob_ptr = sqlite3_value_blob(ptr);
                 var blob_arg = new Uint8Array(size);
-                for (var j = 0; j < size; j += 1) blob_arg[j] = HEAP8[blob_ptr + j];
+                for (var j = 0; j < size; j += 1) {
+                    blob_arg[j] = HEAP8[blob_ptr + j];
+                }
                 return blob_arg;
             }
             var args = [];
@@ -949,7 +1135,10 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
                 var value_ptr = getValue(argv + (4 * i), "i32");
                 var value_type = sqlite3_value_type(value_ptr);
                 var arg;
-                if (value_type === SQLITE_INTEGER || value_type === SQLITE_FLOAT) {
+                if (
+                    value_type === SQLITE_INTEGER
+                    || value_type === SQLITE_FLOAT
+                ) {
                     arg = sqlite3_value_double(value_ptr);
                 } else if (value_type === SQLITE_TEXT) {
                     arg = sqlite3_value_text(value_ptr);
@@ -978,7 +1167,7 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
                     if (result === null) {
                         sqlite3_result_null(cx);
                     } else if (result.length != null) {
-                        var blobptr = allocate(result, "i8", ALLOC_NORMAL);
+                        var blobptr = allocate(result, ALLOC_NORMAL);
                         sqlite3_result_blob(cx, blobptr, result.length, -1);
                         _free(blobptr);
                     } else {
@@ -998,7 +1187,7 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         }
         // The signature of the wrapped function is :
         // void wrapped(sqlite3_context *db, int argc, sqlite3_value **argv)
-        func_ptr = addFunction(wrapped_func, "viii");
+        var func_ptr = addFunction(wrapped_func, "viii");
         this.functions[name] = func_ptr;
         this.handleError(sqlite3_create_function_v2(
             this.db,
@@ -1013,7 +1202,6 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         ));
         return this;
     };
-
 
     // export Database to Module
     Module.Database = Database;

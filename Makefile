@@ -6,9 +6,9 @@
 
 # I got this handy makefile syntax from : https://github.com/mandel59/sqlite-wasm (MIT License) Credited in LICENSE
 # To use another version of Sqlite, visit https://www.sqlite.org/download.html and copy the appropriate values here:
-SQLITE_AMALGAMATION = sqlite-amalgamation-3310100
-SQLITE_AMALGAMATION_ZIP_URL = https://www.sqlite.org/2020/sqlite-amalgamation-3310100.zip
-SQLITE_AMALGAMATION_ZIP_SHA1 = a58e91a39b7b4ab720dbc843c201fb6a18eaf32b
+SQLITE_AMALGAMATION = sqlite-amalgamation-3350000
+SQLITE_AMALGAMATION_ZIP_URL = https://www.sqlite.org/2021/sqlite-amalgamation-3350000.zip
+SQLITE_AMALGAMATION_ZIP_SHA1 = ba64bad885c9f51df765a9624700747e7bf21b79
 
 # Note that extension-functions.c hasn't been updated since 2010-02-06, so likely doesn't need to be updated
 EXTENSION_FUNCTIONS = extension-functions.c
@@ -23,11 +23,13 @@ CFLAGS = \
 	-DSQLITE_DISABLE_LFS \
 	-DSQLITE_ENABLE_FTS3 \
 	-DSQLITE_ENABLE_FTS3_PARENTHESIS \
-	-DSQLITE_THREADSAFE=0
+	-DSQLITE_ENABLE_JSON1 \
+	-DSQLITE_THREADSAFE=0 \
+	-DSQLITE_ENABLE_NORMALIZE
 
 # When compiling to WASM, enabling memory-growth is not expected to make much of an impact, so we enable it for all builds
 # Since tihs is a library and not a standalone executable, we don't want to catch unhandled Node process exceptions
-# So, we do : `NODEJS_CATCH_EXIT=0`, which fixes issue: https://github.com/kripken/sql.js/issues/173 and https://github.com/kripken/sql.js/issues/262
+# So, we do : `NODEJS_CATCH_EXIT=0`, which fixes issue: https://github.com/sql-js/sql.js/issues/173 and https://github.com/sql-js/sql.js/issues/262
 EMFLAGS = \
 	--memory-init-file 0 \
 	-s RESERVED_FUNCTION_POINTERS=64 \
@@ -37,7 +39,8 @@ EMFLAGS = \
 	-s SINGLE_FILE=0 \
 	-s FORCE_FILESYSTEM=1 \
 	-lidbfs.js \
-	-s NODEJS_CATCH_EXIT=0
+	-s NODEJS_CATCH_EXIT=0 \
+	-s NODEJS_CATCH_REJECTION=0
 
 EMFLAGS_ASM = \
 	-s WASM=0
@@ -54,7 +57,8 @@ EMFLAGS_OPTIMIZED= \
 	-s INLINING_LIMIT=50 \
 	-O3 \
 	-flto \
-	--llvm-lto 1
+	--llvm-lto 1 \
+	--closure 1
 
 EMFLAGS_DEBUG = \
 	-s INLINING_LIMIT=10 \
@@ -149,8 +153,10 @@ out/sqlite3.bc: sqlite-src/$(SQLITE_AMALGAMATION)
 	# Generate llvm bitcode
 	$(EMCC) $(CFLAGS) -c sqlite-src/$(SQLITE_AMALGAMATION)/sqlite3.c -o $@
 
-out/extension-functions.bc: sqlite-src/$(SQLITE_AMALGAMATION)/$(EXTENSION_FUNCTIONS)
+# Since the extension-functions.c includes other headers in the sqlite_amalgamation, we declare that this depends on more than just extension-functions.c
+out/extension-functions.bc: sqlite-src/$(SQLITE_AMALGAMATION)
 	mkdir -p out
+	# Generate llvm bitcode
 	$(EMCC) $(CFLAGS) -s LINKABLE=1 -c sqlite-src/$(SQLITE_AMALGAMATION)/extension-functions.c -o $@
 
 # TODO: This target appears to be unused. If we re-instatate it, we'll need to add more files inside of the JS folder
@@ -168,18 +174,20 @@ cache/$(EXTENSION_FUNCTIONS):
 
 ## sqlite-src
 .PHONY: sqlite-src
-sqlite-src: sqlite-src/$(SQLITE_AMALGAMATION) sqlite-src/$(EXTENSION_FUNCTIONS)
+sqlite-src: sqlite-src/$(SQLITE_AMALGAMATION) sqlite-src/$(SQLITE_AMALGAMATION)/$(EXTENSION_FUNCTIONS)
 
-sqlite-src/$(SQLITE_AMALGAMATION): cache/$(SQLITE_AMALGAMATION).zip
-	mkdir -p sqlite-src
+sqlite-src/$(SQLITE_AMALGAMATION): cache/$(SQLITE_AMALGAMATION).zip sqlite-src/$(SQLITE_AMALGAMATION)/$(EXTENSION_FUNCTIONS)
+	mkdir -p sqlite-src/$(SQLITE_AMALGAMATION)
 	echo '$(SQLITE_AMALGAMATION_ZIP_SHA1)  ./cache/$(SQLITE_AMALGAMATION).zip' > cache/check.txt
 	sha1sum -c cache/check.txt
-	rm -rf $@
-	unzip 'cache/$(SQLITE_AMALGAMATION).zip' -d sqlite-src/
+	# We don't delete the sqlite_amalgamation folder. That's a job for clean
+	# Also, the extension functions get copied here, and if we get the order of these steps wrong,
+	# this step could remove the extension functions, and that's not what we want
+	unzip -u 'cache/$(SQLITE_AMALGAMATION).zip' -d sqlite-src/
 	touch $@
 
 sqlite-src/$(SQLITE_AMALGAMATION)/$(EXTENSION_FUNCTIONS): cache/$(EXTENSION_FUNCTIONS)
-	mkdir -p sqlite-src
+	mkdir -p sqlite-src/$(SQLITE_AMALGAMATION)
 	echo '$(EXTENSION_FUNCTIONS_SHA1)  ./cache/$(EXTENSION_FUNCTIONS)' > cache/check.txt
 	sha1sum -c cache/check.txt
 	cp 'cache/$(EXTENSION_FUNCTIONS)' $@
@@ -188,5 +196,4 @@ sqlite-src/$(SQLITE_AMALGAMATION)/$(EXTENSION_FUNCTIONS): cache/$(EXTENSION_FUNC
 .PHONY: clean
 clean:
 	rm -f out/* dist/* cache/*
-	rm -rf sqlite-src/ c/
-
+	rm -rf sqlite-src/
